@@ -1,0 +1,595 @@
+{
+  "generatedFrom": "relay /v1/models + ~/.codex/unified-model-catalog.json",
+  "models": [
+    {
+      "id": "claude-fable-5",
+      "displayName": "Claude Fable 5",
+      "family": "claude",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "anthropic",
+        "openai"
+      ],
+      "visible": false,
+      "contextWindow": 200000
+    },
+    {
+      "id": "claude-fable-5-1",
+      "displayName": "Claude Fable 5.1",
+      "family": "claude",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "anthropic",
+        "openai"
+      ],
+      "visible": false,
+      "contextWindow": 200000
+    },
+    {
+      "id": "claude-haiku-4-5-20251001",
+      "displayName": "Claude Haiku 4.5",
+      "family": "claude",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "anthropic",
+        "openai"
+      ],
+      "visible": true,
+      "contextWindow": 200000
+    },
+    {
+      "id": "claude-haiku-5-5",
+      "displayName": "Claude Haiku 5.5",
+      "family": "claude",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "anthropic",
+        "openai"
+      ],
+      "visible": false,
+      "contextWindow": 200000
+    },
+    {
+      "id": "claude-opus-4-6",
+      "displayName": "Claude Opus 4.6",
+      "family": "claude",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "anthropic",
+        "openai"
+      ],
+      "visible": true,
+      "contextWindow": 200000
+    },
+    {
+      "id": "claude-opus-4-7",
+      "displayName": "Claude Opus 4.7",
+      "family": "claude",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "anthropic",
+        "openai"
+      ],
+      "visible": true,
+      "contextWindow": 200000
+    },
+    {
+      "id": "claude-opus-4-8",
+      "displayName": "Claude Opus 4.8",
+      "family": "claude",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "anthropic",
+        "openai"
+      ],
+      "visible": true,
+      "contextWindow": 200000
+    },
+    {
+      "id": "claude-opus-5",
+      "displayName": "Claude Opus 5",
+      "family": "claude",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "anthropic",
+        "openai"
+      ],
+      "visible": true,
+      "contextWindow": 200000
+    },
+    {
+      "id": "claude-opus-5-5",
+      "displayName": "Claude Opus 5.5",
+      "family": "claude",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "anthropic",
+        "openai"
+      ],
+      "visible": false,
+      "contextWindow": 200000
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "displayName": "Claude Sonnet 4.6",
+      "family": "claude",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "anthropic",
+        "openai"
+      ],
+      "visible": true,
+      "contextWindow": 200000
+    },
+    {
+      "id": "claude-sonnet-5",
+      "displayName": "Claude Sonnet 5",
+      "family": "claude",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "anthropic",
+        "openai"
+      ],
+      "visible": true,
+      "contextWindow": 200000
+    },
+    {
+      "id": "claude-sonnet-5-5",
+      "displayName": "Claude Sonnet 5.5",
+      "family": "claude",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "anthropic",
+        "openai"
+      ],
+      "visible": false,
+      "contextWindow": 200000
+    },
+    {
+      "id": "deepseek-v4-flash",
+      "displayName": "DeepSeek-V4.1-Flash-1017",
+      "family": "deepseek",
+      "reasoningLevels": [
+        "low",
+        "high",
+        "max"
+      ],
+      "defaultReasoning": "low",
+      "inRelay": true,
+      "endpoints": [
+        "openai"
+      ],
+      "visible": true,
+      "contextWindow": 1000000
+    },
+    {
+      "id": "deepseek-v4-pro",
+      "displayName": "DeepSeek V4 Pro",
+      "family": "deepseek",
+      "reasoningLevels": [
+        "low",
+        "high",
+        "max"
+      ],
+      "defaultReasoning": "low",
+      "inRelay": true,
+      "endpoints": [
+        "openai"
+      ],
+      "visible": true,
+      "contextWindow": 1000000
+    },
+    {
+      "id": "deepseek-v4.1-flash",
+      "displayName": "DeepSeek V4.1 Flash",
+      "family": "deepseek",
+      "reasoningLevels": [
+        "low",
+        "high",
+        "max"
+      ],
+      "defaultReasoning": "low",
+      "inRelay": true,
+      "endpoints": [
+        "openai"
+      ],
+      "visible": false,
+      "contextWindow": 1000000
+    },
+    {
+      "id": "gemini-3-flash-preview",
+      "displayName": "Gemini 3 Flash Preview",
+      "family": "gemini",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "gemini",
+        "openai"
+      ],
+      "visible": false,
+      "contextWindow": 1000000
+    },
+    {
+      "id": "gemini-3-pro-preview",
+      "displayName": "Gemini 3 Pro Preview",
+      "family": "gemini",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "gemini",
+        "openai"
+      ],
+      "visible": false,
+      "contextWindow": 1000000
+    },
+    {
+      "id": "gemini-3.1-pro-preview",
+      "displayName": "Gemini 3.1 Pro Preview",
+      "family": "gemini",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "gemini",
+        "openai"
+      ],
+      "visible": false,
+      "contextWindow": 1000000
+    },
+    {
+      "id": "gemini-3.5-flash",
+      "displayName": "Gemini 3.5 Flash",
+      "family": "gemini",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "gemini",
+        "openai"
+      ],
+      "visible": false,
+      "contextWindow": 1000000
+    },
+    {
+      "id": "gemini-3.6-flash",
+      "displayName": "Gemini 3.6 Flash",
+      "family": "gemini",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "gemini",
+        "openai"
+      ],
+      "visible": false,
+      "contextWindow": 1000000
+    },
+    {
+      "id": "gemini-3.7-flash",
+      "displayName": "Gemini 3.7 Flash",
+      "family": "gemini",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "gemini",
+        "openai"
+      ],
+      "visible": false,
+      "contextWindow": 1000000
+    },
+    {
+      "id": "gemini-3.8-flash",
+      "displayName": "Gemini 3.8 Flash",
+      "family": "gemini",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "gemini",
+        "openai"
+      ],
+      "visible": false,
+      "contextWindow": 1000000
+    },
+    {
+      "id": "codex-auto-review",
+      "displayName": "Codex Auto Review",
+      "family": "gpt",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "openai"
+      ],
+      "visible": false,
+      "contextWindow": 272000
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "displayName": "GPT-5.6-Luna",
+      "family": "gpt",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "openai"
+      ],
+      "visible": true,
+      "contextWindow": 272000
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "displayName": "GPT-5.6-Sol",
+      "family": "gpt",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "defaultReasoning": "low",
+      "inRelay": true,
+      "endpoints": [
+        "openai"
+      ],
+      "visible": true,
+      "contextWindow": 272000
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "displayName": "GPT-5.6-Terra",
+      "family": "gpt",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "openai"
+      ],
+      "visible": true,
+      "contextWindow": 272000
+    },
+    {
+      "id": "gpt-6-astra",
+      "displayName": "GPT-6-Astra",
+      "family": "gpt",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "defaultReasoning": "low",
+      "inRelay": true,
+      "endpoints": [
+        "openai"
+      ],
+      "visible": true,
+      "contextWindow": 272000
+    },
+    {
+      "id": "gpt-6-luna",
+      "displayName": "GPT-6-Luna",
+      "family": "gpt",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "defaultReasoning": "medium",
+      "inRelay": true,
+      "endpoints": [
+        "openai"
+      ],
+      "visible": true,
+      "contextWindow": 272000
+    },
+    {
+      "id": "gpt-6-sol",
+      "displayName": "GPT-6-Sol",
+      "family": "gpt",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "defaultReasoning": "low",
+      "inRelay": true,
+      "endpoints": [
+        "openai"
+      ],
+      "visible": true,
+      "contextWindow": 272000
+    },
+    {
+      "id": "gpt-6.1-sol",
+      "displayName": "GPT-6.1-Sol",
+      "family": "gpt",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "defaultReasoning": "low",
+      "inRelay": true,
+      "endpoints": [
+        "openai"
+      ],
+      "visible": true,
+      "contextWindow": 272000
+    },
+    {
+      "id": "gpt-6.1-terra",
+      "displayName": "GPT-6.1-Terra",
+      "family": "gpt",
+      "reasoningLevels": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "defaultReasoning": "low",
+      "inRelay": true,
+      "endpoints": [
+        "openai"
+      ],
+      "visible": true,
+      "contextWindow": 272000
+    }
+  ]
+}

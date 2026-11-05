@@ -1,0 +1,76 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Set CI_RELEASE_ENABLED=true and all four signing secrets to enable publishing.
+    if: ${{ vars.CI_RELEASE_ENABLED == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.9"
+      - name: Prepare private release signing
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -eu
+          : "${KEYSTORE_B64:?Missing signing keystore}"
+          : "${KEYSTORE_PASSWORD:?Missing keystore password}"
+          : "${KEY_ALIAS:?Missing key alias}"
+          : "${KEY_PASSWORD:?Missing key password}"
+          umask 077
+          mkdir -p "$HOME/.pocketagent-release"
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$HOME/.pocketagent-release/release.jks"
+          python3 - <<'PY'
+          import os, pathlib
+          def prop(value):
+              return value.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('=', '\\=').replace(':', '\\:').replace(' ', '\\ ')
+          root = pathlib.Path.home() / '.pocketagent-release'
+          values = {'storeFile': str(root / 'release.jks'), 'storePassword': os.environ['KEYSTORE_PASSWORD'],
+                    'keyAlias': os.environ['KEY_ALIAS'], 'keyPassword': os.environ['KEY_PASSWORD']}
+          (root / 'keystore.properties').write_text(''.join(k + '=' + prop(v) + '\n' for k,v in values.items()))
+          PY
+      - name: Tests and lint
+        run: ./gradlew :app:testDebugUnitTest :app:lintDebug --no-daemon --console=plain
+      - name: Build signed APK and HTML guide
+        env:
+          OPERATOR_NAME: ${{ vars.OPERATOR_NAME }}
+          CONTACT_EMAIL: ${{ vars.CONTACT_EMAIL }}
+        run: |
+          ./gradlew :app:assembleRelease --no-daemon --console=plain \
+            -PoperatorName="$OPERATOR_NAME" -PcontactEmail="$CONTACT_EMAIL"
+          python3 scripts/md2html.py docs/使用指南.md PocketAgent-UserGuide.html
+          python3 - <<'PY'
+          import hashlib, pathlib
+          apk = pathlib.Path('app/build/outputs/apk/release/app-release.apk')
+          guide = pathlib.Path('PocketAgent-UserGuide.html')
+          body = '安装：下载 APK，在 Android 8.0+ 上安装；详细操作见附件 HTML 使用指南。\n\n'
+          body += '源码采用 PolyForm Noncommercial 1.0.0；禁止商业使用。\n\nSHA-256：\n```text\n'
+          for f in (apk, guide):
+              body += hashlib.sha256(f.read_bytes()).hexdigest() + '  ' + f.name + '\n'
+          pathlib.Path('release-notes.md').write_text(body + '```\n')
+          PY
+      - name: Publish APK and HTML guide
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            app/build/outputs/apk/release/app-release.apk
+            PocketAgent-UserGuide.html
+          body_path: release-notes.md

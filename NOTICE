@@ -1,0 +1,29 @@
+PocketAgent
+
+This product includes software developed by third parties:
+
+  Kotlin, kotlinx.coroutines, kotlinx.serialization
+    Copyright JetBrains s.r.o. — Apache License 2.0
+
+  AndroidX (Core, AppCompat, Activity, Fragment, Lifecycle, Biometric)
+    Copyright The Android Open Source Project — Apache License 2.0
+
+  Jetpack Compose (UI, Material3, Material Icons)
+    Copyright The Android Open Source Project — Apache License 2.0
+
+  OkHttp / MockWebServer
+    Copyright Square, Inc. — Apache License 2.0
+
+  sshj
+    Copyright sshj contributors — Apache License 2.0
+
+  JSch (com.github.mwiede)
+    Copyright JCraft, Inc. and contributors — BSD 3-Clause License
+
+  PDFBox-Android (com.tom-roush)
+    Copyright Tom Roush and contributors — Apache License 2.0
+
+  Bouncy Castle (bcprov-jdk18on, bcpkix-jdk18on, bcutil-jdk18on)
+    Copyright The Legion of the Bouncy Castle Inc. — MIT License
+
+Full license texts are available from each project's repository.

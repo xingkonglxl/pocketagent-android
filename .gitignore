@@ -1,0 +1,34 @@
+# Gradle / build outputs
+.gradle/
+.kotlin/
+build/
+app/build/
+
+# Local machine config
+local.properties
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+
+# Scratch
+*.log
+*.hprof
+__pycache__/
+*.pyc
+
+# Never commit secrets
+*.jks
+*.keystore
+*.pem
+*.p12
+keystore.properties
+
+# Runtime credentials / private environment
+.env
+.env.*
+!.env.example
+auth.json
+*.key
+*.pfx

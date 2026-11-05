@@ -1,0 +1,1495 @@
+#!/usr/bin/env python3
+"""手机 ⇄ Mac 的 Codex 会话同步（供 PocketAgent 的 /sync 使用）。
+
+协议（和 Android 端 sync/SyncProtocol.kt 对齐）：
+
+  dump [limit]      一行一组：id \t 标题 \t 开始时间 \t 更新时间(ms) \t 条数 \t 版本
+  dumpids <id...>   只返回指定会话的清单行
+  manifest [token]  增量清单；token 未变时只返回一行
+  dumpfull         完整快照：清单字段后附 gz \t base64(gzip(正文))
+  exportbatch <id...> 一次扫描后导出多组正文
+  rollout [id...]   只把指定会话落成 Codex 原生记录
+  trash            列出回收站中的会话组（JSON）
+  restore <id>     恢复所选组，拒绝覆盖已有文件
+  purge <id>       永久删除所选组的回收站文件，保留活跃会话
+  purgebatch --stdin  从 stdin JSON 数组读取所选 id，一次扫描后批量永久删除
+  list              兼容旧格式：路径 \t 开始时间 \t 条数 \t 首句
+  export <id>       打印某一组的正文
+  （无参数）        兼容旧行为：打印最近一组会话
+
+会话来源两处：
+1. ~/.codex/sessions/**/*.jsonl（终端 Codex 的历史）
+2. ~/.pocketagent/sync/from-phone/*.json（手机推上来的，同 id 时覆盖第 1 种）
+"""
+import base64
+import gzip
+import glob
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+from collections import Counter
+
+MAX_MESSAGES = int(os.environ.get("POCKETAGENT_SYNC_MESSAGES", "0"))
+# 不截断：双向同步要求两边内容一致，截断推回去会把 Mac 上的历史覆盖成残本
+MAX_CHARS = int(os.environ.get("POCKETAGENT_SYNC_CHARS", "50000000"))
+# 0 表示全部；不能把「最近 N 组」冒充完整清单，否则旧会话会被误判为远端没有。
+LIST_LIMIT = int(os.environ.get("POCKETAGENT_SYNC_LIST", "0"))
+MAX_ROLLOUT_BYTES = int(os.environ.get("POCKETAGENT_MAX_ROLLOUT_BYTES", "0"))
+
+FROM_PHONE_DIR = os.path.expanduser(
+    os.environ.get("POCKETAGENT_FROM_PHONE_DIR", "~/.pocketagent/sync/from-phone")
+)
+# 手机会话落成 Codex 原生 rollout 的目录；测试时可以指到临时目录
+CODEX_HOME = os.path.expanduser(os.environ.get("POCKETAGENT_CODEX_HOME", "~/.codex"))
+CODEX_SESSIONS = os.path.join(CODEX_HOME, "sessions")
+CODEX_CONFIG = os.path.join(CODEX_HOME, "config.toml")
+SYNC_CACHE = os.path.expanduser(
+    os.environ.get("POCKETAGENT_SYNC_CACHE", "~/.pocketagent/sync/context-index-v1.json")
+)
+SYNC_CACHE_VERSION = 4
+UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+FRAMED_MAGIC = "<!-- pocketagent-framed-v2 -->"
+LENGTH_PREFIX = "<!-- pocketagent-text-bytes:"
+
+_SYNC_INDEX = None
+_SYNC_INDEX_DIRTY = False
+
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    parts = []
+    for block in content or []:
+        if isinstance(block, dict):
+            if block.get("type") in ("input_text", "output_text", "text"):
+                parts.append(block.get("text") or "")
+        elif isinstance(block, str):
+            parts.append(block)
+    return "\n".join(p for p in parts if p)
+
+
+APPROVAL_HISTORY_PREFIX = "The following is the Codex agent history"
+APPROVAL_RECORD_KEYS = {
+    "outcome", "rationale", "risk_level", "user_authorization",
+}
+PROGRESS_RECORD_KEYS = {
+    "constraints", "critical_references", "current_progress", "next_steps",
+}
+
+
+def approval_record(text):
+    """Match the desktop approval JSON that must never become mobile chat history."""
+    trimmed = text.strip()
+    if not trimmed.startswith("{"):
+        return False
+    if '"outcome"' not in trimmed and '"current_progress"' not in trimmed:
+        return False
+    try:
+        row = json.loads(trimmed)
+    except (ValueError, TypeError):
+        row = None
+    if isinstance(row, dict):
+        if "current_progress" in row and set(row).issubset(PROGRESS_RECORD_KEYS):
+            return True
+        outcome = row.get("outcome")
+        rationale = row.get("rationale")
+        return (
+            isinstance(outcome, str)
+            and outcome.strip().lower() in {"allow", "allowed", "approved", "deny", "denied", "reject", "rejected"}
+            and (rationale is None or isinstance(rationale, str))
+            and set(row).issubset(APPROVAL_RECORD_KEYS)
+        )
+    outcome = re.search(r'"outcome"\s*:\s*"([^"]+)"', trimmed)
+    if '"current_progress"' in trimmed:
+        return True
+    return bool(
+        outcome
+        and outcome.group(1).strip().lower()
+        in {"allow", "allowed", "approved", "deny", "denied", "reject", "rejected"}
+    )
+
+
+def internal_sync_message(role, text):
+    if text.lstrip().startswith((
+        APPROVAL_HISTORY_PREFIX,
+        "<codex_internal_context",
+        "<environment_context>",
+        "# AGENTS.md",
+        "<INSTRUCTIONS>",
+    )):
+        return True
+    return role == "assistant" and approval_record(text)
+
+
+def all_rollouts():
+    files = glob.glob(os.path.join(CODEX_SESSIONS, "**", "*.jsonl"), recursive=True)
+    if not files:
+        return []
+    return sorted(files, key=os.path.getmtime, reverse=True)
+
+
+def file_signature(path):
+    stat = os.stat(path)
+    return [stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino]
+
+
+def sync_index():
+    """Small metadata-only index: never cache conversation bodies."""
+    global _SYNC_INDEX
+    if _SYNC_INDEX is not None:
+        return _SYNC_INDEX
+    try:
+        with open(SYNC_CACHE, encoding="utf-8") as fh:
+            value = json.load(fh)
+        if value.get("version") != SYNC_CACHE_VERSION:
+            raise ValueError("cache version")
+        value.setdefault("merged", {})
+        for key in ("rollouts", "groups", "phone", "merged"):
+            if not isinstance(value.get(key), dict):
+                raise ValueError("cache shape")
+    except (OSError, ValueError, TypeError, AttributeError):
+        value = {
+            "version": SYNC_CACHE_VERSION,
+            "rollouts": {},
+            "groups": {},
+            "phone": {},
+            "merged": {},
+        }
+    _SYNC_INDEX = value
+    return value
+
+
+def save_sync_index():
+    global _SYNC_INDEX_DIRTY
+    if not _SYNC_INDEX_DIRTY or _SYNC_INDEX is None:
+        return
+    directory = os.path.dirname(SYNC_CACHE) or "."
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".context-index-", dir=directory)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(_SYNC_INDEX, fh, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(temporary, SYNC_CACHE)
+            os.chmod(SYNC_CACHE, 0o600)
+            _SYNC_INDEX_DIRTY = False
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        # An unwritable cache only makes the next call slower; it must not break sync.
+        pass
+
+
+def message_digests(messages):
+    values = []
+    for role, text in messages:
+        raw = text.encode("utf-8")
+        value = hashlib.sha256()
+        value.update(role.encode("ascii"))
+        value.update(len(raw).to_bytes(8, "big"))
+        value.update(raw)
+        values.append(value.hexdigest())
+    return values
+
+
+def message_digest(messages):
+    return digest_values(message_digests(messages))
+
+
+def digest_values(values):
+    digest = hashlib.sha256()
+    for value in values:
+        digest.update(value.encode("ascii"))
+    return digest.hexdigest()
+
+
+def sequence_revision(values):
+    digest = hashlib.sha256()
+    digest.update(b"pocketagent-message-sequence-v1\0")
+    for value in values:
+        digest.update(value.encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()[:16]
+
+
+def rollout_identity(path):
+    """Read only the session_meta row unless an unchanged full entry is cached."""
+    global _SYNC_INDEX_DIRTY
+    cache = sync_index()
+    try:
+        signature = file_signature(path)
+    except OSError:
+        return None
+    cached = cache["rollouts"].get(path)
+    if isinstance(cached, dict) and cached.get("signature") == signature:
+        return cached
+    session_id = ""
+    started = ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                payload = row.get("payload") or {}
+                if row.get("type") == "session_meta":
+                    session_id = str(payload.get("session_id") or payload.get("id") or "")
+                    started = str(payload.get("timestamp") or "")
+                    break
+    except OSError:
+        return None
+    entry = {
+        "signature": signature,
+        "session_id": session_id,
+        "started": started,
+        "complete": False,
+    }
+    cache["rollouts"][path] = entry
+    _SYNC_INDEX_DIRTY = True
+    return entry
+
+
+def rollout_file_metadata(path):
+    """Reuse parsed metadata while the rollout's size/mtime/inode are unchanged."""
+    global _SYNC_INDEX_DIRTY
+    cache = sync_index()
+    try:
+        signature = file_signature(path)
+    except OSError:
+        return None
+    if MAX_ROLLOUT_BYTES > 0:
+        try:
+            if signature[0] > MAX_ROLLOUT_BYTES:
+                raise ValueError("会话文件超过配置上限，拒绝返回不完整清单")
+        except OSError:
+            return None
+    cached = cache["rollouts"].get(path)
+    if (isinstance(cached, dict) and cached.get("signature") == signature
+            and cached.get("complete") and isinstance(cached.get("messageDigests"), list)
+            and isinstance(cached.get("firstUserTitle"), str)):
+        return cached
+    session_id = started = ""
+    messages = []
+    for _attempt in range(2):
+        try:
+            session_id, started, messages = read_messages(path)
+            after_read = file_signature(path)
+        except Exception:
+            return None
+        if after_read == signature:
+            break
+        # Codex 可能正在追加；切到刚刚完整读完的那一版，下一轮再校验。
+        signature = after_read
+    else:
+        return None
+    values = message_digests(messages)
+    first_user = next((body for role, body in messages if role == "user"), "")
+    entry = {
+        "signature": signature,
+        "session_id": session_id,
+        "started": started,
+        "messageCount": len(messages),
+        "messageDigest": digest_values(values),
+        "messageDigests": values,
+        "firstUserTitle": first_user.replace("\n", " ").strip()[:60],
+        "valid": bool(messages),
+        "complete": True,
+    }
+    cache["rollouts"][path] = entry
+    _SYNC_INDEX_DIRTY = True
+    return entry
+
+
+def normalize_wanted(wanted):
+    if wanted is None:
+        return None
+    if isinstance(wanted, str):
+        return {wanted}
+    return set(wanted)
+
+
+def wanted_paths(wanted):
+    wanted = normalize_wanted(wanted)
+    all_paths = all_rollouts()
+    if wanted is None:
+        return all_paths
+    paths = []
+    for path in all_paths:
+        identity = rollout_identity(path) or {}
+        if (identity.get("session_id") in wanted
+                or any(value in os.path.basename(path) for value in wanted)):
+            paths.append(path)
+    return paths
+
+
+def read_messages(path):
+    messages = []
+    session_id = ""
+    started = ""
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            payload = row.get("payload") or {}
+            if row.get("type") == "session_meta":
+                session_id = str(payload.get("session_id") or payload.get("id") or "")
+                started = str(payload.get("timestamp") or "")
+                continue
+            if row.get("type") != "response_item" or payload.get("type") != "message":
+                continue
+            role = payload.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            body = text_of(payload.get("content")).strip()
+            if not body:
+                continue
+            if body.startswith("<environment_context>") or body.startswith("# AGENTS.md"):
+                continue
+            if internal_sync_message(role, body):
+                continue
+            messages.append((role, body))
+    return session_id, started, messages
+
+
+def render(session_id, title, started, messages):
+    out = ["# Codex 会话同步", FRAMED_MAGIC, f"- 会话：{session_id}", f"- 标题：{title}", f"- 开始：{started}", "- 来源：mac", ""]
+    if MAX_MESSAGES > 0 and len(messages) > MAX_MESSAGES:
+        raise ValueError("会话条数超过配置上限，拒绝截断导出")
+    out.append(render_tail(messages))
+    text = "\n".join(out)
+    if len(text) <= MAX_CHARS:
+        return text
+    raise SystemExit(
+        f"会话 {session_id} 有 {len(text)} 字符，超过 {MAX_CHARS} 上限；"
+        "为避免双向同步丢内容，拒绝截断导出（可用 POCKETAGENT_SYNC_CHARS 调大）"
+    )
+
+
+def safe_name(raw):
+    return "".join(c if (c.isalnum() or c in "-_") else "_" for c in str(raw))
+
+
+def read_phone_file(path):
+    with open(path, encoding="utf-8") as fh:
+        row = json.load(fh)
+    ctx_id = str(row.get("id") or "").strip()
+    body = normalize_phone_body(str(row.get("body") or ""), int(row.get("count") or 0))
+    if not ctx_id or not body:
+        return None, None
+    title = str(row.get("title") or "")[:60]
+    started = str(row.get("startedAt") or "")
+    records = message_records(body)
+    clean_records = [
+        record for record in records
+        if not internal_sync_message(record[0], record[1])
+    ]
+    filtered = len(clean_records) != len(records)
+    count_mismatch = int(row.get("count") or 0) not in (0, len(records))
+    if filtered:
+        header = body.split("\n## ", 1)[0].rstrip()
+        body = header + "\n\n" + render_tail(clean_records) + "\n"
+    if filtered or count_mismatch:
+        revision = hashlib.sha1(body.encode("utf-8")).hexdigest()[:16]
+    else:
+        revision = str(row.get("rev") or hashlib.sha1(body.encode("utf-8")).hexdigest()[:16])
+    return row, {
+        "id": ctx_id,
+        "title": title,
+        "started": started,
+        "updated": int(row.get("updatedAt") or int(os.path.getmtime(path) * 1000)),
+        "count": len(clean_records),
+        "rev": revision,
+        "_messageDigests": message_digests(
+            [(role, text) for role, text, _meta in clean_records]
+        ),
+        "body": body,
+    }
+
+
+def sync_phone_markdown(context):
+    # Keep the readable copy current only when the source JSON changed or the copy vanished.
+    md_path = os.path.join(FROM_PHONE_DIR, safe_name(context["id"]) + ".md")
+    try:
+        existing = None
+        if os.path.exists(md_path):
+            with open(md_path, encoding="utf-8", errors="replace") as fh:
+                existing = fh.read()
+        if existing != context["body"]:
+            with open(md_path, "w", encoding="utf-8") as fh:
+                fh.write(context["body"])
+    except Exception:
+        pass
+
+
+def from_phone_contexts(wanted=None, include_body=False):
+    global _SYNC_INDEX_DIRTY
+    cache = sync_index()
+    wanted = normalize_wanted(wanted)
+    contexts = []
+    for path in sorted(glob.glob(os.path.join(FROM_PHONE_DIR, "*.json"))):
+        if wanted is not None and os.path.basename(path)[:-5] not in {safe_name(value) for value in wanted}:
+            continue
+        try:
+            signature = file_signature(path)
+        except OSError:
+            continue
+        cached = cache["phone"].get(path)
+        if (isinstance(cached, dict) and cached.get("signature") == signature and cached.get("context")
+                and isinstance(cached["context"].get("_messageDigests"), list)):
+            context = dict(cached["context"])
+            md_path = os.path.join(FROM_PHONE_DIR, safe_name(context["id"]) + ".md")
+            needs_rollout = (
+                os.environ.get("POCKETAGENT_CODEX_ROLLOUT", "1") != "0"
+                and os.path.isdir(CODEX_HOME)
+                and rollout_path_for(context["id"]) is None
+            )
+            if include_body or needs_rollout or not os.path.exists(md_path):
+                try:
+                    _row, loaded = read_phone_file(path)
+                except Exception:
+                    loaded = None
+                if loaded:
+                    context = {key: value for key, value in loaded.items() if key != "body"}
+                    sync_phone_markdown(loaded)
+                    ensure_codex_rollout(loaded)
+                    cache["phone"][path] = {
+                        "signature": file_signature(path),
+                        "context": context,
+                    }
+                    _SYNC_INDEX_DIRTY = True
+                    if include_body:
+                        context = dict(context, body=loaded["body"])
+            contexts.append(context)
+            continue
+        try:
+            _row, loaded = read_phone_file(path)
+        except Exception:
+            continue
+        if not loaded:
+            continue
+        context = {key: value for key, value in loaded.items() if key != "body"}
+        sync_phone_markdown(loaded)
+        # 顺手落一份 Codex 原生会话：电脑上 `codex resume <id>` 能直接接上
+        ensure_codex_rollout(loaded)
+        cache["phone"][path] = {
+            "signature": signature,
+            "context": context,
+        }
+        _SYNC_INDEX_DIRTY = True
+        if include_body:
+            context = dict(context, body=loaded["body"])
+        contexts.append(context)
+    save_sync_index()
+    return contexts
+
+
+def codex_contexts(limit, wanted=None, include_body=False):
+    global _SYNC_INDEX_DIRTY
+    cache = sync_index()
+    # Codex 续聊会给同一个 session_id 再开一个 rollout 文件，
+    # 这里按 session_id 合并，避免手机上出现两组重复上下文。
+    paths = wanted_paths(wanted)
+    by_session = {}
+    for path in paths:
+        entry = rollout_file_metadata(path)
+        if not entry or not entry.get("valid"):
+            continue
+        key = entry.get("session_id") or path
+        by_session.setdefault(key, []).append((entry.get("started") or "", path))
+
+    contexts = []
+    current_groups = set()
+    for key, runs in by_session.items():
+        current_groups.add(key)
+        try:
+            runs.sort(key=lambda row: (row[0], os.path.getmtime(row[1])))
+        except OSError:
+            continue
+        token = [[path, os.stat(path).st_mtime_ns,
+                  cache["rollouts"].get(path, {}).get("messageDigest", "")]
+                 for _started, path in runs]
+        cached = cache["groups"].get(key)
+        if isinstance(cached, dict) and cached.get("token") == token:
+            if cached.get("skip"):
+                continue
+            context = cached.get("context")
+            if not context:
+                continue
+            if include_body:
+                bodies = _codex_group_body(key, runs)
+                if bodies is None:
+                    continue
+                context = dict(context, body=bodies)
+            context = dict(context, _messageDigests=cached.get("messageDigests") or [])
+            contexts.append(context)
+            continue
+
+        cached_context = cached.get("context") if isinstance(cached, dict) else None
+        cached_digests = cached.get("messageDigests") if isinstance(cached, dict) else None
+        run_digests = [cache["rollouts"].get(path, {}).get("messageDigests") for _started, path in runs]
+        if any(value is None for value in run_digests):
+            continue
+        merged_digests = []
+        for values in run_digests:
+            append_history(merged_digests, values)
+        if not merged_digests:
+            continue
+        title = next(
+            (
+                cache["rollouts"].get(path, {}).get("firstUserTitle", "")
+                for _started, path in runs
+                if cache["rollouts"].get(path, {}).get("firstUserTitle")
+            ),
+            "",
+        )
+        if title.startswith("The following is the Codex agent history"):
+            cache["groups"][key] = {"token": token, "skip": True}
+            _SYNC_INDEX_DIRTY = True
+            continue
+        try:
+            updated = int(max(os.path.getmtime(path) for _started, path in runs) * 1000)
+        except OSError:
+            continue
+        ctx_id = key if key != "" else ("codex-" + hashlib.sha1(runs[0][1].encode("utf-8")).hexdigest()[:12])
+        context = {
+            "id": ctx_id,
+            "title": title,
+            "started": runs[0][0],
+            "updated": updated,
+            "count": len(merged_digests),
+            "rev": cached_context["rev"]
+            if cached_context and cached_digests == merged_digests
+            else sequence_revision(merged_digests),
+            "_messageDigests": merged_digests,
+        }
+        cache["groups"][key] = {
+            "token": token,
+            "context": context,
+            "messageDigests": merged_digests,
+        }
+        _SYNC_INDEX_DIRTY = True
+        if include_body:
+            bodies = _codex_group_body(key, runs)
+            if bodies is None:
+                continue
+            context = dict(context, body=bodies)
+        contexts.append(context)
+
+    if wanted is None:
+        cache["groups"] = {
+            key: value for key, value in cache["groups"].items() if key in current_groups
+        }
+        surviving = set(paths)
+        cache["rollouts"] = {
+            path: value for path, value in cache["rollouts"].items() if path in surviving
+        }
+        _SYNC_INDEX_DIRTY = True
+    save_sync_index()
+    contexts.sort(key=lambda context: context["updated"], reverse=True)
+    return contexts[:limit] if limit > 0 else contexts
+
+
+def _codex_group_body(key, runs):
+    merged_messages = []
+    for _started, path in runs:
+        try:
+            _session_id, _file_started, messages = read_messages(path)
+        except Exception:
+            continue
+        append_history(merged_messages, messages)
+    if not merged_messages:
+        return None
+    cached = sync_index()["groups"].get(key, {}).get("context") or {}
+    return render(
+        cached.get("id") or key,
+        cached.get("title") or "",
+        cached.get("started") or runs[0][0],
+        merged_messages,
+    )
+
+
+def append_history(existing, messages):
+    """续聊重放可能远超 40 条；线性匹配完整重叠，不删除用户有意重复的消息。"""
+    if not messages or (len(messages) <= len(existing) and existing[:len(messages)] == messages):
+        return
+    sequence = list(messages) + [None] + existing[-len(messages):]
+    prefixes = [0] * len(sequence)
+    for index in range(1, len(sequence)):
+        matched = prefixes[index - 1]
+        while matched and sequence[index] != sequence[matched]:
+            matched = prefixes[matched - 1]
+        if sequence[index] == sequence[matched]:
+            matched += 1
+        prefixes[index] = matched
+    existing.extend(messages[prefixes[-1]:])
+
+
+def unseen_occurrences(messages, have):
+    """按出现次数比较，不能用 set 把新一轮相同的提问或回答吞掉。"""
+    remaining = Counter(have)
+    extra = []
+    for message in messages:
+        if remaining[message] > 0:
+            remaining[message] -= 1
+        else:
+            extra.append(message)
+    return extra
+
+
+def merged_many(limit, wanted=None, include_body=False):
+    """同一组会话可能两边都有：手机推上来的副本 + Mac 上继续聊产生的 rollout。
+
+    以前这里让手机副本直接「遮住」Mac 的 rollout，结果是：手机上做的事推到 Mac 后，
+    再用 codex resume 接着聊，新内容永远不会回到手机。现在合并两边：
+    以手机副本的正文为底（保留工具调用/思考等元数据），把 Mac 独有的消息追加在后面。
+    清单只返回元数据；正文只在确实需要传输某组时读取。
+    """
+    wanted = normalize_wanted(wanted)
+    if include_body:
+        phone = {context["id"]: context for context in from_phone_contexts(wanted, include_body=True)}
+        out = {}
+        for context in codex_contexts(0, wanted, include_body=True):
+            local = phone.pop(context["id"], None)
+            if local:
+                merged_context = merge_pair(local, context)
+                merged_context.update(merged_metadata(local, context))
+                out[context["id"]] = merged_context
+            else:
+                out[context["id"]] = context
+        out.update(phone)
+    else:
+        phone = {context["id"]: context for context in from_phone_contexts(wanted)}
+        codex = {context["id"]: context for context in codex_contexts(0, wanted)}
+        overlap = set(phone) & set(codex)
+        merge_cache = sync_index()["merged"]
+        out = {}
+        for context in codex.values():
+            local = phone.get(context["id"])
+            if not local:
+                out[context["id"]] = context
+                continue
+            key = merged_cache_key(local, context)
+            cached = merge_cache.get(context["id"])
+            if cached and cached.get("key") == key and cached.get("context"):
+                out[context["id"]] = dict(cached["context"])
+                continue
+            metadata = merged_metadata(local, context)
+            merge_cache[context["id"]] = {"key": key, "context": metadata}
+            _mark_index_dirty()
+            out[context["id"]] = metadata
+        for context in phone.values():
+            if context["id"] not in out:
+                out[context["id"]] = context
+    save_sync_index()
+    ordered = sorted(out.values(), key=lambda context: context["updated"], reverse=True)
+    return ordered[:limit] if limit > 0 else ordered
+
+
+def merged(limit, wanted=None, include_body=False):
+    return merged_many(limit, wanted, include_body=include_body)
+
+
+def metadata_line(context):
+    title = context["title"].replace("\t", " ").replace("\n", " ")
+    return "\t".join(
+        [
+            context["id"],
+            title,
+            context["started"].replace("\t", " "),
+            str(context["updated"]),
+            str(context["count"]),
+            context["rev"],
+        ]
+    )
+
+
+def merged_cache_key(local, remote):
+    return [
+        local.get("rev"), local.get("updated"), local.get("count"), local.get("title"),
+        remote.get("rev"), remote.get("updated"), remote.get("count"), remote.get("title"),
+        sequence_revision(local.get("_messageDigests") or []),
+        sequence_revision(remote.get("_messageDigests") or []),
+    ]
+
+
+def merged_metadata(local, remote):
+    """Compute merge_pair's public result without materializing either body."""
+    local_digests = local.get("_messageDigests") or []
+    remote_digests = remote.get("_messageDigests") or []
+    if not local_digests:
+        return public_local_metadata(local, local_digests)
+    extra = unseen_occurrences(remote_digests, local_digests)
+    if not extra:
+        return public_local_metadata(local, local_digests)
+    newer = int(remote.get("updated") or 0) > int(local.get("updated") or 0)
+    prefix = len(local_digests) <= len(remote_digests) and remote_digests[:len(local_digests)] == local_digests
+    if not (newer or prefix):
+        return public_local_metadata(local, local_digests)
+    digest = hashlib.sha256()
+    digest.update(b"pocketagent-merged-v1\0")
+    digest.update(str(local.get("rev") or "").encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(str(remote.get("rev") or "").encode("utf-8"))
+    for value in local_digests:
+        digest.update(value.encode("ascii"))
+    digest.update(b"\0")
+    for value in extra:
+        digest.update(value.encode("ascii"))
+    return {
+        "id": local.get("id") or remote.get("id") or "",
+        "title": local.get("title") or remote.get("title") or "",
+        "started": local.get("started") or remote.get("started") or "",
+        "updated": max(int(local.get("updated") or 0), int(remote.get("updated") or 0)),
+        "count": len(local_digests) + len(extra),
+        "rev": digest.hexdigest()[:16],
+    }
+
+
+def public_local_metadata(local, digests):
+    result = {
+        name: local.get(name, default)
+        for name, default in (
+            ("id", ""), ("title", ""), ("started", ""), ("updated", 0), ("count", 0), ("rev", "")
+        )
+    }
+    if digests and result["count"] != len(digests):
+        result["count"] = len(digests)
+        result["rev"] = sequence_revision(digests)
+    return result
+
+
+def _mark_index_dirty():
+    global _SYNC_INDEX_DIRTY
+    _SYNC_INDEX_DIRTY = True
+
+
+def manifest_token(contexts):
+    digest = hashlib.sha256()
+    for context in sorted(contexts, key=lambda row: row["id"]):
+        digest.update(json.dumps(
+            [context["id"], context.get("title", ""), context.get("count", 0), context.get("rev", "")],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()[:32]
+
+
+def codex_model_provider():
+    """Codex 会检查会话里的 model_provider 是否还配置着；跟着本机 config.toml 走。"""
+    try:
+        with open(CODEX_CONFIG, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                stripped = line.strip()
+                if stripped.startswith("model_provider"):
+                    return stripped.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return "openai"
+
+
+def rollout_message_rows(path):
+    rows = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                payload = row.get("payload") or {}
+                if row.get("type") != "response_item" or payload.get("type") != "message":
+                    continue
+                role = payload.get("role")
+                if role not in ("user", "assistant"):
+                    continue
+                text = text_of(payload.get("content")).strip()
+                if text:
+                    rows.append((role, text))
+    except Exception:
+        pass
+    return rows
+
+
+def rollout_row(role, text):
+    return {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": role,
+            "content": [
+                {"type": "input_text" if role == "user" else "output_text", "text": text}
+            ],
+        },
+    }
+
+
+def ensure_codex_rollout(ctx):
+    """把手机端的会话落成 Codex 原生 rollout，电脑上就能 `codex resume <会话id>` 接着聊。
+
+    只写一次；之后手机上新增的消息追加到末尾，Mac 上自己聊出来的内容原样保留。
+    格式是最小集合（session_meta + response_item），实测这个版本的 codex resume 能认。
+    """
+    if os.environ.get("POCKETAGENT_CODEX_ROLLOUT", "1") == "0":
+        return
+    # 目标机上没装 Codex（没有 ~/.codex）就别造目录了，md/json 副本照样能用
+    if not os.path.isdir(CODEX_HOME):
+        return
+    try:
+        ctx_id = str(ctx.get("id") or "")
+        if not re.fullmatch(UUID_RE, ctx_id):
+            return
+        records = message_records(ctx.get("body") or "")
+        if ctx.get("count", 0) > 0 and len(records) != ctx["count"]:
+            # 老版本无角色标记的正文可能已歧义，不能把错误解析追加到原生历史。
+            return
+        messages = [
+            (role, text.strip())
+            for role, text, _meta in records
+            # 斜杠命令回显不是对话内容，别带进 Codex 的历史里
+            if text.strip() and not (role == "user" and text.lstrip().startswith("/"))
+        ]
+        existing = rollout_path_for(ctx_id)
+        if existing:
+            # 空会话也有价值：手机在全新对话里第一次用 /workspace 时，先建 session_meta，
+            # 下一句就能 resume 同一个 id，避免电脑上多出一条重复会话。
+            if not messages:
+                return
+            path = existing
+            todo = unseen_occurrences(messages, rollout_message_rows(path))
+            if not todo:
+                return
+            with open(path, "a", encoding="utf-8") as fh:
+                for role, text in todo:
+                    fh.write(json.dumps(rollout_row(role, text), ensure_ascii=False) + "\n")
+            return
+        stamp = time.localtime()
+        day = os.path.join(CODEX_SESSIONS, time.strftime("%Y/%m/%d", stamp))
+        os.makedirs(day, exist_ok=True)
+        path = os.path.join(
+            day,
+            "rollout-" + time.strftime("%Y-%m-%dT%H-%M-%S", stamp) + "-" + ctx_id + ".jsonl",
+        )
+        started = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        meta = {
+            "timestamp": started,
+            "type": "session_meta",
+            "payload": {
+                "id": ctx_id,
+                "session_id": ctx_id,
+                "timestamp": started,
+                "cwd": os.path.expanduser("~"),
+                "originator": "pocketagent",
+                "cli_version": "0.1.0",
+                "model_provider": codex_model_provider(),
+            },
+        }
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(meta, ensure_ascii=False) + "\n")
+            for role, text in messages:
+                fh.write(json.dumps(rollout_row(role, text), ensure_ascii=False) + "\n")
+        _ROLLOUT_INDEX[ctx_id] = path
+    except Exception:
+        # 写不出原生会话不影响同步本身：md/json 副本照样能用
+        pass
+
+
+_ROLLOUT_INDEX = {}
+_ROLLOUT_INDEX_READY = False
+
+
+def rollout_path_for(ctx_id):
+    """一次同步只扫一遍 ~/.codex/sessions：会话多的时候逐个 glob 会很慢。"""
+    global _ROLLOUT_INDEX_READY
+    if not _ROLLOUT_INDEX_READY:
+        _ROLLOUT_INDEX_READY = True
+        for path in glob.glob(os.path.join(CODEX_SESSIONS, "**", "rollout-*.jsonl"), recursive=True):
+            found = re.search(UUID_RE, os.path.basename(path))
+            if found:
+                _ROLLOUT_INDEX.setdefault(found.group(0), path)
+    return _ROLLOUT_INDEX.get(ctx_id)
+
+
+def framed_records(body):
+    data = body.encode("utf-8")
+    offset = 0
+    out = []
+    started = False
+
+    def line():
+        nonlocal offset
+        if offset >= len(data):
+            raise ValueError("缺少同步帧")
+        end = data.find(b"\n", offset)
+        if end < 0:
+            end = len(data)
+        value = data[offset:end].decode("utf-8")
+        offset = min(end + 1, len(data))
+        return value
+
+    while offset < len(data):
+        header = line()
+        role = next((r for r in ("user", "assistant") if header == f"## {r} <!-- pocketagent-role:{r} -->"), None)
+        if role is None:
+            if started and header.strip():
+                raise ValueError("同步帧之间包含无效内容")
+            continue
+        started = True
+        meta = ""
+        length = line()
+        if length.startswith("<!-- pocketagent-message-v1:"):
+            meta = length
+            length = line()
+        if not length.startswith(LENGTH_PREFIX) or not length.endswith(" -->"):
+            raise ValueError("缺少消息长度")
+        count = int(length[len(LENGTH_PREFIX):-4])
+        if count < 0 or offset + count > len(data):
+            raise ValueError("同步正文不完整")
+        text = data[offset:offset + count].decode("utf-8")
+        offset += count
+        if line() != "" or line() != "<!-- pocketagent-message-end -->":
+            raise ValueError("同步帧结束标记缺失")
+        out.append((role, text, meta))
+    return out
+
+
+def message_records(body):
+    """与手机 SyncProtocol 一致：有标记时只认标记，代码围栏中的标题是正文。"""
+    if body.startswith("# Codex 会话同步\n" + FRAMED_MAGIC + "\n"):
+        return framed_records(body)
+    out = []
+    role = None
+    buf = []
+    fence = None
+    tagged = "<!-- pocketagent-role:" in body
+    meta = ""
+
+    def flush():
+        if role is not None:
+            text = "\n".join(buf).strip()
+            if text or meta:
+                out.append((role, text, meta))
+
+    for line in body.splitlines():
+        clean = line.rstrip()
+        if fence is not None:
+            buf.append(line)
+            if line.lstrip().startswith(fence):
+                fence = None
+            continue
+        head = None
+        for candidate in ("user", "assistant"):
+            expected = f"## {candidate} <!-- pocketagent-role:{candidate} -->" if tagged else f"## {candidate}"
+            if clean == expected:
+                head = candidate
+        if head:
+            flush()
+            role = head
+            buf = []
+            meta = ""
+        elif tagged and clean == "<!-- pocketagent-message-end -->":
+            flush()
+            role = None
+            buf = []
+            meta = ""
+        elif role is not None:
+            # 只忽略元数据行；用户正文里其它 HTML 注释必须保留。
+            if not buf and clean.startswith("<!-- pocketagent-message-v1:") and clean.endswith(" -->"):
+                meta = line
+                continue
+            if line.lstrip().startswith("```"):
+                fence = "```"
+            elif line.lstrip().startswith("~~~"):
+                fence = "~~~"
+            buf.append(line)
+    flush()
+    return out
+
+
+def message_list(body):
+    return [(role, text.strip()) for role, text, _ in message_records(body)]
+
+
+def normalize_phone_body(body, count):
+    """可确认边界的旧手机正文迁移到 v2；含歧义的旧正文原样保留，留待重新导出。"""
+    if not body or body.startswith("# Codex 会话同步\n" + FRAMED_MAGIC + "\n"):
+        return body
+    records = message_records(body)
+    if count > 0:
+        # 旧版未闭合围栏会吞后面的角色。只有显式角色和 END 数量都完全相符时才恢复。
+        headers = list(re.finditer(r"^## (user|assistant) <!-- pocketagent-role:\1 -->\n", body, re.M))
+        ends = list(re.finditer(r"^<!-- pocketagent-message-end -->$", body, re.M))
+        if len(headers) == count and len(ends) == count:
+            records = []
+            for index, (header, end) in enumerate(zip(headers, ends)):
+                if end.start() < header.end() or (index + 1 < count and end.end() > headers[index + 1].start()):
+                    return body
+                text = body[header.end():end.start()]
+                if text.endswith("\n"):
+                    text = text[:-1]
+                meta = ""
+                if text.startswith("<!-- pocketagent-message-v1:"):
+                    meta, _, text = text.partition("\n")
+                records.append((header.group(1), text, meta))
+        elif len(records) != count:
+            return body
+    # 保留原来的会话头、工具调用元数据及正文，不改文件里的源数据或内容版本号。
+    head = body.split("\n## ", 1)[0]
+    first, _, rest = head.partition("\n")
+    return first + "\n" + FRAMED_MAGIC + "\n" + rest.rstrip() + "\n\n" + render_tail(records) + "\n"
+
+
+def render_tail(messages):
+    blocks = []
+    for message in messages:
+        role, text = message[:2]
+        meta = message[2] if len(message) > 2 else ""
+        blocks.append(f"## {role} <!-- pocketagent-role:{role} -->\n" +
+                      (meta + "\n" if meta else "") +
+                      f"{LENGTH_PREFIX}{len(text.encode('utf-8'))} -->\n" + text +
+                      "\n<!-- pocketagent-message-end -->")
+    return "\n\n".join(blocks)
+
+
+def merge_pair(local, remote):
+    """local = 手机推上来的副本，remote = Mac 上同 id 的 rollout。"""
+    if not local:
+        return remote
+    local_msgs = message_list(local["body"])
+    if local.get("count", 0) > 0 and len(local_msgs) != local["count"]:
+        # 一组遗留会话异常不能让其它所有组同步失败；也不能擅自猜边界再覆盖正文。
+        return local
+    remote_msgs = message_list(remote["body"])
+    extra = unseen_occurrences(remote_msgs, local_msgs)
+    if not extra:
+        # Mac 那边没有新内容：保持手机副本原样，rev 不变，手机端不会误判为有更新
+        return local
+    # 只在「Mac 这一份确实更新」时把多出来的消息并回去：
+    # - 时间戳更新（Mac 上刚继续聊过）
+    # - 手机这份是 Mac 那份的前缀（明确的同一条线往下长）
+    # 否则（例如手机刚 /compact 过，历史被有意压缩）以手机为准，避免把压缩掉的历史又灌回来。
+    newer = int(remote.get("updated") or 0) > int(local.get("updated") or 0)
+    prefix = len(local_msgs) <= len(remote_msgs) and remote_msgs[: len(local_msgs)] == local_msgs
+    if not (newer or prefix):
+        return local
+    # 旧版本手机副本没有角色标记，追加前先整体迁移，避免混用两种格式。
+    original = local["body"]
+    if not original.startswith("# Codex 会话同步\n" + FRAMED_MAGIC + "\n"):
+        records = message_records(original)
+        if local.get("count", 0) > 0 and len(records) != local["count"]:
+            raise ValueError("旧版手机会话解析不完整，拒绝合并覆盖")
+        original = render(local["id"], local.get("title", ""), local.get("started", ""), records)
+    body = original.rstrip() + "\n\n" + render_tail(extra) + "\n"
+    merged_ctx = dict(local)
+    merged_ctx["body"] = body
+    merged_ctx["count"] = len(message_list(body))
+    merged_ctx["rev"] = hashlib.sha1(body.encode("utf-8")).hexdigest()[:16]
+    merged_ctx["updated"] = max(int(local.get("updated") or 0), int(remote.get("updated") or 0))
+    if not merged_ctx.get("title"):
+        merged_ctx["title"] = remote.get("title") or ""
+    return merged_ctx
+
+
+def cmd_dump(limit):
+    for context in merged_many(limit):
+        sys.stdout.write(metadata_line(context) + "\n")
+
+
+def cmd_dump_ids(ids):
+    ids = list(dict.fromkeys(str(value) for value in ids if valid_context_id(str(value))))
+    for context in merged_many(0, ids):
+        sys.stdout.write(metadata_line(context) + "\n")
+
+
+def cmd_manifest(known_token=""):
+    contexts = merged_many(0)
+    token = manifest_token(contexts)
+    if known_token and known_token == token:
+        sys.stdout.write(f"pocketagent-manifest-v1\t{token}\tunchanged\n")
+        return
+    sys.stdout.write(f"pocketagent-manifest-v1\t{token}\tchanged\n")
+    for context in contexts:
+        sys.stdout.write(metadata_line(context) + "\n")
+
+
+def cmd_rollout(wanted=None):
+    """推送结束后由 App 调一次：把 from-phone 里的会话补成 Codex 原生记录。"""
+    from_phone_contexts(wanted)
+
+
+def cmd_dump_full(limit, wanted=None):
+    """一次把所有正文带回去：base64(gzip(body))，比逐组 export 快一个数量级。"""
+    for context in merged_many(limit, wanted, include_body=True):
+        body = context["body"].encode("utf-8")
+        payload = base64.b64encode(gzip.compress(body, 6)).decode("ascii")
+        title = context["title"].replace("\t", " ").replace("\n", " ")
+        line = "\t".join(
+            [context["id"], title, context["started"].replace("\t", " "), str(context["updated"]),
+             str(context["count"]), context["rev"], "gz", payload]
+        )
+        sys.stdout.write(line + "\n")
+
+
+def cmd_dump_full_ids(ids):
+    cmd_dump_full(0, list(dict.fromkeys(ids)))
+
+
+TRASH_DIR = os.path.expanduser(os.environ.get("POCKETAGENT_TRASH_DIR", "~/.pocketagent/trash"))
+TRASH_PROTOCOL = "pocketagent-trash-v1"
+
+
+def valid_context_id(ctx_id):
+    return isinstance(ctx_id, str) and re.fullmatch(r"[\w-]{1,200}", ctx_id) is not None
+
+
+def file_identity(path, with_title=True):
+    """Only read enough to identify a backup; never return its full conversation."""
+    if path.endswith(".jsonl"):
+        ctx_id, title = "", ""
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                payload = row.get("payload") or {}
+                if row.get("type") == "session_meta":
+                    ctx_id = str(payload.get("session_id") or payload.get("id") or "")
+                    if not with_title:
+                        return ctx_id, ""
+                if row.get("type") == "response_item" and payload.get("role") == "user":
+                    text = text_of(payload.get("content")).strip()
+                    if text and not text.startswith(("# AGENTS.md", "<environment_context>")):
+                        title = text[:60].replace("\n", " ")
+                        break
+        return ctx_id, title
+    if path.endswith(".json"):
+        with open(path, encoding="utf-8") as fh:
+            row = json.load(fh)
+        return str(row.get("id") or ""), str(row.get("title") or "")[:60]
+    if path.endswith(".md"):
+        return os.path.basename(path)[:-3], ""
+    return "", ""
+
+
+def trash_file(path, directory):
+    """Manifests are data, not authority to delete an arbitrary path or symlink."""
+    return (os.path.dirname(os.path.abspath(path)) == os.path.abspath(directory)
+            and os.path.basename(path) != "moved.json"
+            and not os.path.islink(path) and os.path.isfile(path))
+
+
+def restore_destination(path):
+    path = os.path.abspath(path)
+    real = os.path.realpath(path)
+    sessions = os.path.realpath(CODEX_SESSIONS) + os.sep
+    phone = os.path.realpath(FROM_PHONE_DIR)
+    return ((real.startswith(sessions) and path.endswith(".jsonl")) or
+            (os.path.dirname(real) == phone and path.endswith((".json", ".md"))))
+
+
+def trash_groups(wanted=None, with_titles=True):
+    """Include legacy orphan files left by same-second manifest collisions."""
+    if os.path.islink(TRASH_DIR):
+        raise ValueError("回收站目录不能是符号链接")
+    groups = {}
+    for directory in sorted(glob.glob(os.path.join(TRASH_DIR, "*"))):
+        if os.path.islink(directory) or not os.path.isdir(directory):
+            continue
+        manifest = os.path.join(directory, "moved.json")
+        data = {}
+        if not os.path.islink(manifest):
+            try:
+                with open(manifest, encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if not isinstance(data, dict):
+                    data = {}
+            except (OSError, ValueError):
+                pass
+        candidates = []
+        seen = set()
+        for record in data.get("files") or []:
+            if not isinstance(record, dict):
+                continue
+            src, dst = record.get("to"), record.get("from")
+            if not isinstance(src, str) or not isinstance(dst, str):
+                continue
+            if trash_file(src, directory) and restore_destination(dst) and valid_context_id(data.get("id")):
+                if os.path.abspath(src) in seen:
+                    continue
+                if wanted is None or data["id"] in wanted:
+                    candidates.append((data["id"], str(data.get("title") or "")[:60], src, dst))
+                seen.add(os.path.abspath(src))
+        for src in sorted(glob.glob(os.path.join(directory, "*"))):
+            if os.path.abspath(src) in seen or not trash_file(src, directory):
+                continue
+            try:
+                ctx_id, title = file_identity(src, with_title=with_titles)
+            except (OSError, ValueError, AttributeError, TypeError):
+                continue
+            if not valid_context_id(ctx_id) or (wanted is not None and ctx_id not in wanted):
+                continue
+            if src.endswith(".jsonl"):
+                dst = os.path.join(CODEX_SESSIONS, "recovered", os.path.basename(src))
+            elif src.endswith((".json", ".md")):
+                dst = os.path.join(FROM_PHONE_DIR, safe_name(ctx_id) + os.path.splitext(src)[1])
+            else:
+                continue
+            candidates.append((ctx_id, title, src, dst))
+        deleted_at = data.get("deletedAt")
+        if not isinstance(deleted_at, (int, float)):
+            deleted_at = int(os.path.getmtime(directory) * 1000)
+        for ctx_id, title, src, dst in candidates:
+            group = groups.setdefault(ctx_id, {"id": ctx_id, "title": "", "deletedAt": 0, "files": []})
+            if not title and with_titles:
+                try:
+                    _, title = file_identity(src)
+                except (OSError, ValueError, AttributeError, TypeError):
+                    pass
+            if title:
+                group["title"] = title
+            group["deletedAt"] = max(group["deletedAt"], deleted_at)
+            group["files"].append({"from": dst, "to": src})
+    return groups
+
+
+def cmd_trash():
+    entries = []
+    for group in trash_groups().values():
+        entries.append({key: group[key] for key in ("id", "title", "deletedAt")})
+        entries[-1]["bytes"] = sum(os.path.getsize(f["to"]) for f in group["files"])
+    entries.sort(key=lambda item: (-item["deletedAt"], item["id"]))
+    print(json.dumps({"protocol": TRASH_PROTOCOL, "entries": entries}, ensure_ascii=False))
+
+
+def clean_trash_manifests(directories, ctx_id):
+    for directory in directories:
+        manifest = os.path.join(directory, "moved.json")
+        if not os.path.islink(manifest):
+            try:
+                with open(manifest, encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if data.get("id") == ctx_id and not any(
+                        trash_file(f.get("to", ""), directory) for f in data.get("files") or [] if isinstance(f, dict)):
+                    os.remove(manifest)
+            except (OSError, ValueError, AttributeError):
+                pass
+        try:
+            os.rmdir(directory)  # Only remove an empty directory, never another group's files.
+        except OSError:
+            pass
+
+
+def purge_records(ctx_id, records):
+    """Only unlink the already selected trash files, never rescan per group."""
+    directories = set()
+    for item in records:
+        src = item["to"]
+        directory = os.path.dirname(src)
+        if not trash_file(src, directory):
+            raise ValueError("回收站文件已变化，请刷新后重试")
+        os.remove(src)
+        directories.add(directory)
+    clean_trash_manifests(directories, ctx_id)
+    return len(records)
+
+
+def cmd_purge(ctx_id):
+    """Permanently remove only this group's trash backups; never active rollouts."""
+    if not valid_context_id(ctx_id):
+        raise ValueError("无效的会话 id")
+    records = trash_groups({ctx_id}, with_titles=False).get(ctx_id, {}).get("files", [])
+    purge_records(ctx_id, records)
+    print(json.dumps({"protocol": TRASH_PROTOCOL, "deletedFiles": len(records)}))
+
+
+def cmd_purge_batch(ids):
+    # Validate the entire request before deleting anything. No invalid id may widen selection.
+    if not isinstance(ids, list) or len(ids) > 10000 or not all(valid_context_id(i) for i in ids):
+        raise ValueError("无效的批量会话 id")
+    ids = list(dict.fromkeys(ids))
+    groups = trash_groups(set(ids), with_titles=False) if ids else {}
+    results = []
+    for ctx_id in ids:
+        try:
+            count = purge_records(ctx_id, groups.get(ctx_id, {}).get("files", []))
+            results.append({"id": ctx_id, "deletedFiles": count})
+        except (OSError, ValueError) as exc:
+            # Do not send private file paths back in error messages.
+            detail = exc.strerror if isinstance(exc, OSError) else str(exc)
+            results.append({"id": ctx_id, "deletedFiles": 0,
+                            "error": type(exc).__name__ + ": " + (detail or "删除失败")})
+    print(json.dumps({"protocol": "pocketagent-trash-batch-v1", "results": results}))
+
+
+def cmd_delete(ctx_id, permanent=False):
+    """将指定组的 rollout 和手机副本移到回收站；显式 permanent 时直接删除。"""
+    if not valid_context_id(ctx_id):
+        raise ValueError("无效的会话 id")
+    moved = []
+    paths = []
+    title = ""
+    for path in all_rollouts():
+        try:
+            sid, _ = file_identity(path, with_title=False)
+        except (OSError, ValueError, AttributeError, TypeError):
+            continue
+        if sid == ctx_id:
+            paths.append(path)
+            _, candidate_title = file_identity(path)
+            title = candidate_title or title
+    for ext in (".json", ".md"):
+        path = os.path.join(FROM_PHONE_DIR, safe_name(ctx_id) + ext)
+        if os.path.isfile(path) and not os.path.islink(path):
+            paths.append(path)
+            if ext == ".json":
+                try:
+                    _, candidate_title = file_identity(path)
+                    title = candidate_title or title
+                except (OSError, ValueError, AttributeError, TypeError):
+                    pass
+    if permanent:
+        for path in paths:
+            os.remove(path)
+            moved.append(path)
+        print("\n".join(moved) if moved else "（这台机器上没有这组会话的副本）")
+        return
+    if not paths:
+        print("（Mac 上没有这组会话的副本）")
+        return
+    os.makedirs(TRASH_DIR, mode=0o700, exist_ok=True)
+    if os.path.islink(TRASH_DIR):
+        raise ValueError("回收站目录不能是符号链接")
+    trash = tempfile.mkdtemp(prefix=time.strftime("%Y%m%d-%H%M%S") + "-", dir=TRASH_DIR)
+    records = []
+    for index, path in enumerate(paths):
+        target = os.path.join(trash, str(index) + "-" + os.path.basename(path))
+        records.append({"from": path, "to": target})
+    # Record every destination before moving anything, so interrupted deletes remain recoverable.
+    with open(os.path.join(trash, "moved.json"), "x", encoding="utf-8") as fh:
+        os.chmod(fh.name, 0o600)
+        json.dump({"id": ctx_id, "title": title, "deletedAt": int(time.time() * 1000), "files": records},
+                  fh, ensure_ascii=False)
+        fh.flush()
+        os.fsync(fh.fileno())
+    for record in records:
+        os.replace(record["from"], record["to"])
+        moved.append(record["to"])
+    print("\n".join(moved) if moved else "（Mac 上没有这组会话的副本）")
+
+
+def cmd_restore(ctx_id):
+    """从回收站把某一组会话搬回原位置；回收站被清过就返回空。"""
+    if not valid_context_id(ctx_id):
+        raise ValueError("无效的会话 id")
+    records = trash_groups().get(ctx_id, {}).get("files", [])
+    destinations = [item["from"] for item in records]
+    if len(set(destinations)) != len(destinations):
+        raise ValueError("存在多个指向同一位置的备份，未覆盖任何文件，请在电脑上检查回收站")
+    for dst in destinations:
+        if not restore_destination(dst) or os.path.lexists(dst):
+            raise ValueError("原位置已有文件或路径不安全，未覆盖，请检查后重试")
+    restored = []
+    directories = set()
+    for item in records:
+        src, dst = item["to"], item["from"]
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        # 原子地创建目标：即使预检后有其它进程新建同名文件，也绝不覆盖它。
+        os.link(src, dst)
+        os.unlink(src)
+        restored.append(dst)
+        directories.add(os.path.dirname(src))
+    clean_trash_manifests(directories, ctx_id)
+    print("\n".join(restored) if restored else "回收站里没有这组（可能已被清理）")
+
+
+def cmd_list():
+    for ctx in merged(LIST_LIMIT):
+        sys.stdout.write(f"{ctx['id']}\t{ctx['started']}\t{ctx['count']}\t{ctx['title']}\n")
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] == "trash":
+        cmd_trash()
+        return
+    if args and args[0] == "purge" and len(args) == 2:
+        cmd_purge(args[1])
+        return
+    if args and args[0] == "purgebatch":
+        if args[1:] == ["--stdin"]:
+            data = sys.stdin.read(2 * 1024 * 1024 + 1)
+            if len(data) > 2 * 1024 * 1024:
+                raise ValueError("批量请求过大")
+            ids = json.loads(data)
+        else:
+            ids = args[1:]
+        cmd_purge_batch(ids)
+        return
+    if args and args[0] == "exportfull" and len(args) > 1:
+        # 正文、版本、条数来自同一个快照；直接按 id 查，不受最近 N 组窗口影响。
+        cmd_dump_full(0, args[1])
+        return
+    if args and args[0] == "exportbatch" and len(args) > 1:
+        # One index scan and one merged snapshot for the whole batch.
+        cmd_dump_full_ids(args[1:])
+        return
+    if args and args[0] == "dumpfull":
+        limit = int(args[1]) if len(args) > 1 and args[1].isdigit() else LIST_LIMIT
+        cmd_dump_full(limit)
+        return
+    if args and args[0] == "dump":
+        limit = int(args[1]) if len(args) > 1 and args[1].isdigit() else LIST_LIMIT
+        cmd_dump(limit)
+        return
+    if args and args[0] == "dumpids" and len(args) > 1:
+        cmd_dump_ids(args[1:])
+        return
+    if args and args[0] == "manifest":
+        cmd_manifest(args[1] if len(args) > 1 else "")
+        return
+    if args and args[0] == "restore" and len(args) > 1:
+        cmd_restore(args[1])
+        return
+    if args and args[0] == "rollout":
+        cmd_rollout(args[1:] or None)
+        return
+    if args and args[0] == "delete" and len(args) > 1:
+        cmd_delete(args[1], permanent="--permanent" in args[2:])
+        return
+    if args and args[0] == "list":
+        cmd_list()
+        return
+
+    contexts = merged(0, args[1]) if args and args[0] == "export" and len(args) > 1 else merged(LIST_LIMIT)
+    if args and args[0] == "export" and len(args) > 1:
+        wanted = args[1]
+        hit = next((c for c in contexts if c["id"] == wanted), None)
+        if hit is None:
+            raise SystemExit("找不到指定会话")
+        sys.stdout.write(hit["body"])
+        return
+
+    if not contexts:
+        print("（本机没有 codex 会话）")
+        return
+    sys.stdout.write(contexts[0]["body"])
+
+
+if __name__ == "__main__":
+    main()
