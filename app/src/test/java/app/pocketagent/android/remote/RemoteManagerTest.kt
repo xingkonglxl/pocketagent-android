@@ -2,8 +2,13 @@ package app.pocketagent.android.remote
 
 import app.pocketagent.android.security.InMemorySecretStore
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Rule
@@ -116,6 +121,76 @@ class RemoteManagerTest {
         assertTrue(alpha.copy(host = "https://example.com").configurationError() != null)
         assertTrue(alpha.copy(codexExecutable = "codex; command").configurationError() != null)
         assertEquals("host.invalid", alpha.copy(host = " host.invalid ").normalized().host)
+    }
+
+    private class RecordingShell : RemoteShell {
+        var closes = 0
+        var failure: Exception? = null
+        override suspend fun exec(command: String, timeoutMs: Long): RemoteResult {
+            failure?.let { throw it }
+            return RemoteResult(0, command)
+        }
+        override suspend fun close() { closes++ }
+    }
+
+    private fun connectedManager(connect: (SshHost) -> RemoteShell): RemoteManager {
+        val store = RemoteConfigStore(tmp.newFolder())
+        store.save(listOf(alpha, alphaProd))
+        val secrets = InMemorySecretStore()
+        listOf(alpha, alphaProd).forEach { secrets.put("ssh_key_${it.id}", "fixture-key") }
+        return RemoteManager(store, secrets, connect = connect)
+    }
+
+    @Test
+    fun `switching hosts preserves each active connection`() = runBlocking {
+        val remote = connectedManager { RecordingShell() }
+        val first = remote.shell(alpha.id) as RecordingShell
+        val second = remote.shell(alphaProd.id) as RecordingShell
+        assertSame(first, remote.shell(alpha.id))
+        assertEquals(0, first.closes)
+        assertEquals(0, second.closes)
+        remote.close()
+        assertEquals(1, first.closes)
+        assertEquals(1, second.closes)
+    }
+
+    @Test
+    fun `connection failure and invalid host leave other hosts connected`() = runBlocking {
+        val remote = connectedManager { RecordingShell() }
+        val failed = remote.shell(alpha.id) as RecordingShell
+        val healthy = remote.shell(alphaProd.id) as RecordingShell
+        failed.failure = RemoteConnectionException("disconnected")
+        assertTrue(runCatching { remote.exec("test", hostId = alpha.id) }.isFailure)
+        assertEquals(1, failed.closes)
+        assertSame(healthy, remote.shell(alphaProd.id))
+        assertEquals(0, healthy.closes)
+        assertTrue(runCatching { remote.exec("test", hostId = "missing") }.isFailure)
+        assertSame(healthy, remote.shell(alphaProd.id))
+        remote.close()
+    }
+
+    @Test
+    fun `cancelling an operation leaves its shared shell available`() = runBlocking {
+        val remote = connectedManager { RecordingShell() }
+        val shell = remote.shell(alpha.id) as RecordingShell
+        shell.failure = CancellationException("cancelled")
+        assertTrue(runCatching { remote.exec("test", hostId = alpha.id) }.isFailure)
+        assertSame(shell, remote.shell(alpha.id))
+        assertEquals(0, shell.closes)
+        remote.close()
+    }
+
+    @Test
+    fun `concurrent requests share exactly one shell per host`() = runBlocking {
+        val created = java.util.concurrent.atomic.AtomicInteger()
+        val remote = connectedManager {
+            created.incrementAndGet()
+            RecordingShell()
+        }
+        val connections = (1..20).map { async(Dispatchers.Default) { remote.shell(alpha.id) } }.awaitAll()
+        assertEquals(1, created.get())
+        connections.forEach { assertSame(connections.first(), it) }
+        remote.close()
     }
 
 }

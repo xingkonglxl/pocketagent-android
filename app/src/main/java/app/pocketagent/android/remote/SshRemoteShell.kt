@@ -84,11 +84,15 @@ class SshRemoteShell(
         check(!closed) { "SshRemoteShell 已关闭，请重新创建" }
         execLock.withLock {
             val ssh = clientOrConnect()
-            val session = channelOpen("打开 SSH 双向会话", connectTimeoutMs.toLong()) { ssh.startSession() }
+            var session: Session? = null
             try {
+                session = channelOpen("打开 SSH 双向会话", connectTimeoutMs.toLong()) { ssh.startSession() }
                 runDuplex(session, wrapWithWorkDir(command, host.workDir), timeoutMs, input, onStdoutLine)
+            } catch (e: RemoteConnectionException) {
+                dropClient(ssh)
+                throw e
             } finally {
-                withContext(NonCancellable) { closeSessionQuietly(session) }
+                withContext(NonCancellable) { session?.let { closeSessionQuietly(it) } }
             }
         }
     }
@@ -131,7 +135,16 @@ class SshRemoteShell(
             val out = stdout.awaitText()
             val err = stderr.awaitText()
             if (timedOut) RemoteResult.timeout(timeoutMs, out, err)
-            else RemoteResult(cmd.exitStatus ?: 255, out, err)
+            else {
+                val status = cmd.exitStatus
+                if (status == null) {
+                    abort()
+                    RemoteResult(255, out, listOf(err.trim(), "SSH 通道已断开，未收到远端退出码")
+                        .filter { it.isNotEmpty() }.joinToString("\n"))
+                } else {
+                    RemoteResult(status, out, err)
+                }
+            }
         } finally {
             // 先关 channel 解除被 SSH 窗口阻塞的 writer，再等待子协程退出。
             writer.cancel()
@@ -236,6 +249,7 @@ class SshRemoteShell(
                 try {
                     hop.connect(hopHost, host.jumpPort)
                     hop.authPublickey(host.jumpUser ?: host.user, provider)
+                    hop.connection.keepAlive.keepAliveInterval = 15
                     fresh.connectVia(hop.newDirectConnection(host.host, host.port))
                 } catch (e: Exception) {
                     disconnectQuietly(hop)
@@ -244,6 +258,7 @@ class SshRemoteShell(
                 jump = hop
             }
             fresh.authPublickey(host.user, provider)
+            fresh.connection.keepAlive.keepAliveInterval = 15
             // 建连/认证阶段必须有有限超时；认证完成后的长命令由每次 exec 的 deadline 管。
             fresh.setTimeout(0)
             jump?.setTimeout(0)

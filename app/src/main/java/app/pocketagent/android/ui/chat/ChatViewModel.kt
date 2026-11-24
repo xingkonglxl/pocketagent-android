@@ -539,6 +539,7 @@ class ChatViewModel(
         if (remoteHost != null && remoteHost.copy(codexHarnessAvailable = null) !in detectedHarnessHosts) {
             pendingHarnessSend = raw to images
             _state.update { it.copy(running = true, error = null, notice = L10n.t("正在检测远端 harness…")) }
+            val keepAlive = app.pocketagent.android.ChatRunService.start(container.appContext)
             job = viewModelScope.launch {
                 try {
                     withContext(Dispatchers.IO) { detectHarness(remoteHost.id) }
@@ -553,7 +554,7 @@ class ChatViewModel(
                     _state.update { it.copy(running = false, notice = null, error = e.message ?: L10n.t("远端 harness 检测失败，请重试")) }
                     job = null
                 }
-            }
+            }.also { it.invokeOnCompletion { keepAlive.close() } }
             return
         }
         sendWithDetectedHarness(raw, images)
@@ -646,9 +647,8 @@ class ChatViewModel(
         // 桌面 Codex 的 fast 是 service_tier=priority，不是“关工具、只回一轮”。
         val effective = withFastMode(provider, _state.value.fastMode)
 
+        val keepAlive = app.pocketagent.android.ChatRunService.start(container.appContext)
         job = viewModelScope.launch {
-            // 挂前台服务：切到别的 App 或锁屏时系统不会冻结进程，流式回复能继续跑完。
-            app.pocketagent.android.ChatRunService.start(container.appContext)
             try {
                 // 和桌面 Codex 一样：系统提示词后面补上环境信息、AGENTS.md 和工作方式
                 val withInstructions = withContext(Dispatchers.IO) {
@@ -771,10 +771,9 @@ class ChatViewModel(
                 _state.update { it.copy(running = false, error = e.message ?: "请求失败") }
             } finally {
                 job = null
-                app.pocketagent.android.ChatRunService.stop(container.appContext)
                 dispatchQueuedSend()
             }
-        }
+        }.also { it.invokeOnCompletion { keepAlive.close() } }
     }
 
     private fun shouldUseRemoteHarness(): Boolean {
@@ -866,11 +865,11 @@ class ChatViewModel(
         _state.update { it.copy(title = conversation.title) }
         persist()
 
+        val keepAlive = app.pocketagent.android.ChatRunService.start(
+            container.appContext,
+            "${host.name} · ${remoteModel ?: "Codex"} 正在工作",
+        )
         job = container.appScope.launch {
-            app.pocketagent.android.ChatRunService.start(
-                container.appContext,
-                "${host.name} · ${remoteModel ?: "Codex"} 正在工作",
-            )
             try {
                 // Activity 被系统销毁时 ViewModel 的持久化队列也会停止；先直接落盘用户消息。
                 withContext(Dispatchers.IO) { container.conversationStore.upsert(conversation) }
@@ -938,11 +937,13 @@ class ChatViewModel(
                         )
                     }
                 }
+                // 断线结果也保留原生会话，后续同步和续聊可以找到同一个任务。
+                result.threadId?.let { threadId ->
+                    conversation = conversation.copy(remoteThreadId = threadId, remoteHostId = host.id)
+                    _state.update { it.copy(remoteThreadId = threadId, remoteHostId = host.id) }
+                }
                 if (result.unconfirmedSteeringIds.isNotEmpty()) {
                     heldSteeringIds = result.unconfirmedSteeringIds
-                    result.threadId?.let { threadId ->
-                        conversation = conversation.copy(remoteThreadId = threadId, remoteHostId = host.id)
-                    }
                     _state.update {
                         it.copy(
                             unconfirmedFollowUps = true,
@@ -1054,10 +1055,9 @@ class ChatViewModel(
                 }
             } finally {
                 job = null
-                app.pocketagent.android.ChatRunService.stop(container.appContext)
                 dispatchQueuedSend()
             }
-        }
+        }.also { it.invokeOnCompletion { keepAlive.close() } }
     }
 
     fun stop() {

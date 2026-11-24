@@ -22,8 +22,8 @@ android {
         applicationId = "app.pocketagent.android"
         minSdk = 26
         targetSdk = 35
-        versionCode = 105
-        versionName = "1.0.0"
+        versionCode = 106
+        versionName = "1.0.1"
         // 分享版：不预置公司跳板机/主机，其余功能一致（打包时 -PshareBuild=true）
         buildConfigField("boolean", "SHARE_BUILD", (project.findProperty("shareBuild") ?: "false").toString())
         // 发布版默认不注入任何内网主机/中转站；只有显式 -PinternalBuild=true 才启用

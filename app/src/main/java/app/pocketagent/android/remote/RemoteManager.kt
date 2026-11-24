@@ -1,13 +1,16 @@
 package app.pocketagent.android.remote
 
 import app.pocketagent.android.security.SecretStore
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import java.io.File
 
 /**
- * 管理「当前选中的远程主机」这一条 SSH 连接：
+ * 按主机复用 SSH 连接：
  * - 主机配置在 ssh_hosts.json（不含私钥）
  * - 私钥在 SecretStore（Keystore 加密），key 名 `ssh_key_<hostId>`
- * - 连接复用，切换主机或连接出错时重建
+ * - 切换工作区时保留其他主机正在使用的连接
  */
 class RemoteManager(
     private val store: RemoteConfigStore,
@@ -22,8 +25,7 @@ class RemoteManager(
     fun hostKeyVerifier(): net.schmizz.sshj.transport.verification.HostKeyVerifier =
         TofuHostKeyVerifier(knownHostsFile)
 
-    private var cachedId: String? = null
-    private var cachedShell: RemoteShell? = null
+    private val shells = mutableMapOf<String, RemoteShell>()
 
     override fun hosts(): List<SshHost> = store.load()
 
@@ -56,41 +58,36 @@ class RemoteManager(
         if (key.isNullOrBlank()) {
             throw RemoteConnectionException("${host.label()} 还没有导入私钥；先在远程设置里导入对应 PEM/PPK")
         }
-        synchronized(this) {
-            if (cachedId == host.id && cachedShell != null) return cachedShell!!
+        return synchronized(shells) {
+            shells.getOrPut(host.id) {
+                connect(host.withKey(key, secrets.get(passphraseName(host.id))))
+            }
         }
-        close()
-        val shell = connect(host.withKey(key, secrets.get(passphraseName(host.id))))
-        synchronized(this) {
-            cachedId = host.id
-            cachedShell = shell
-        }
-        return shell
     }
 
-    override suspend fun exec(command: String, timeoutMs: Long, hostId: String?): RemoteResult =
-        try {
-            shell(hostId).exec(command, timeoutMs)
-        } catch (e: RemoteConnectionException) {
-            // 连接层失败（对端断开、隧道重连、Mac 睡眠醒来）时，这条 shell 已经不可信。
-            // 以前这里直接往外抛、缓存保留，之后每条命令都会立刻报同一个
-            // "Broken transport; encountered EOF"，同步 /「全部保留」全挂。
-            close()
+    override suspend fun exec(command: String, timeoutMs: Long, hostId: String?): RemoteResult {
+        val shell = shell(hostId)
+        return try {
+            shell.exec(command, timeoutMs)
+        } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            // 连接可能已经断了，丢缓存，下一次重建
-            close()
+            // 仅移除本次失败的连接，迟到的失败也不能清掉已经重建的缓存。
+            synchronized(shells) {
+                shells.entries.removeAll { it.value === shell }
+            }
+            withContext(NonCancellable) { runCatching { shell.close() } }
             throw e
         }
+    }
 
     suspend fun close() {
-        val shell = synchronized(this) {
-            val s = cachedShell
-            cachedShell = null
-            cachedId = null
-            s
+        val connections = synchronized(shells) {
+            shells.values.toList().also { shells.clear() }
         }
-        runCatching { shell?.close() }
+        withContext(NonCancellable) {
+            connections.forEach { shell -> runCatching { shell.close() } }
+        }
     }
 
     fun keyName(hostId: String): String = "ssh_key_$hostId"

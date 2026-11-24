@@ -348,20 +348,19 @@ class SyncViewModel(private val container: AppContainer) : ViewModel() {
         notification: String = "正在处理同步冲突（切到后台也会继续）",
         block: suspend () -> Unit,
     ) {
+        val keepAlive = app.pocketagent.android.ChatRunService.start(container.appContext, notification)
         syncJob = viewModelScope.launch {
-            app.pocketagent.android.ChatRunService.start(container.appContext, notification)
             try {
                 block()
             } catch (e: CancellationException) {
                 _state.update { it.copy(message = L10n.t("已停止同步")) }
                 throw e
             } finally {
-                app.pocketagent.android.ChatRunService.stop(container.appContext)
                 _state.update { it.copy(busy = false) }
                 syncJob = null
                 refresh()
             }
-        }
+        }.also { it.invokeOnCompletion { keepAlive.close() } }
     }
 
     fun openTrash() {

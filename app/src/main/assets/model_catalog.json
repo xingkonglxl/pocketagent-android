@@ -572,6 +572,46 @@
       "contextWindow": 272000
     },
     {
+      "id": "gpt-6.2-astra",
+      "displayName": "GPT-6.2-Astra",
+      "family": "gpt",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "defaultReasoning": "low",
+      "inRelay": true,
+      "endpoints": [
+        "openai"
+      ],
+      "visible": true,
+      "contextWindow": 272000
+    },
+    {
+      "id": "gpt-6.2-sol",
+      "displayName": "GPT-6.2-Sol",
+      "family": "gpt",
+      "reasoningLevels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "defaultReasoning": "low",
+      "inRelay": true,
+      "endpoints": [
+        "openai"
+      ],
+      "visible": true,
+      "contextWindow": 272000
+    },
+    {
       "id": "gpt-6.1-terra",
       "displayName": "GPT-6.1-Terra",
       "family": "gpt",

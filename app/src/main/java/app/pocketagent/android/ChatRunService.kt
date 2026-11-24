@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.IBinder
 import android.os.PowerManager
+import android.util.Log
 
 /**
  * 回复期间的前台服务。
@@ -29,15 +30,17 @@ class ChatRunService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            releaseWakeLock()
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
-            return START_NOT_STICKY
+        synchronized(runs) {
+            // startForegroundService 可能在任务结束后才送达，仍须先兑现前台启动。
+            val text = runs.values.lastOrNull() ?: DEFAULT_TEXT
+            startForeground(NOTIFICATION_ID, buildNotification(this, text))
+            if (runs.isEmpty()) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelfResult(startId)
+            } else {
+                acquireWakeLock()
+            }
         }
-        val text = intent?.getStringExtra(EXTRA_TEXT)?.takeIf { it.isNotBlank() } ?: "切到后台或锁屏也不会中断"
-        startForeground(NOTIFICATION_ID, buildNotification(this, text))
-        acquireWakeLock()
         return START_NOT_STICKY
     }
 
@@ -64,29 +67,36 @@ class ChatRunService : Service() {
         private const val CHANNEL_ID = "chat_run"
         private const val NOTIFICATION_ID = 41
         private const val ACTION_START = "app.pocketagent.android.CHAT_RUN_START"
-        private const val ACTION_STOP = "app.pocketagent.android.CHAT_RUN_STOP"
-        private const val EXTRA_TEXT = "app.pocketagent.android.CHAT_RUN_TEXT"
+        private const val DEFAULT_TEXT = "正在处理回复，后台继续运行"
+        private val runs = linkedMapOf<Any, String>()
         /** 兜底上限：即使异常退出没走 stop，唤醒锁也会在一小时后自动释放。 */
         private const val MAX_WAKE_LOCK_MS = 60L * 60L * 1000L
 
-        fun start(context: Context, text: String = "切到后台或锁屏也不会中断") {
-            runCatching {
-                val intent = Intent(context, ChatRunService::class.java)
-                    .setAction(ACTION_START)
-                    .putExtra(EXTRA_TEXT, text)
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                    context.startForegroundService(intent)
-                } else {
-                    context.startService(intent)
+        /** 在用户操作入口调用，每个任务仅释放自己持有的保活。 */
+        fun start(context: Context, text: String = DEFAULT_TEXT): AutoCloseable {
+            val app = context.applicationContext
+            val token = Any()
+            synchronized(runs) {
+                val needsStart = runs.isEmpty()
+                runs[token] = text
+                if (needsStart) {
+                    val intent = Intent(app, ChatRunService::class.java).setAction(ACTION_START)
+                    try {
+                        app.startForegroundService(intent)
+                    } catch (e: RuntimeException) {
+                        runs.remove(token)
+                        Log.e("ChatRunService", "无法启动后台保活服务", e)
+                    }
                 }
             }
-        }
-
-        fun stop(context: Context) {
-            // 回复结束往往发生在 App 已经切到后台的时候：这时 startService 会被系统拒绝
-            // （BackgroundServiceStartNotAllowed），通知和唤醒锁就挂在那儿不走了。
-            // stopService 不受这个限制，直接走 onDestroy 释放。
-            runCatching { context.stopService(Intent(context, ChatRunService::class.java)) }
+            return AutoCloseable {
+                synchronized(runs) {
+                    if (runs.remove(token) != null && runs.isEmpty()) {
+                        // 后台完成时使用 stopService，避免后台启动服务限制。
+                        app.stopService(Intent(app, ChatRunService::class.java))
+                    }
+                }
+            }
         }
 
         private fun ensureChannel(context: Context) {

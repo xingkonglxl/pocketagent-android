@@ -548,6 +548,22 @@ class SlashCommandFlowTest {
     }
 
     @Test
+    fun `GPT 6_2 models are visible selectable and preserve their reasoning levels`() {
+        for (id in listOf("gpt-6.2-sol", "gpt-6.2-astra")) {
+            val model = vm.state.value.catalog.single { it.id == id }
+            assertTrue(model.visible)
+            assertEquals(272_000, model.contextWindow)
+            assertEquals(listOf("low", "medium", "high", "xhigh", "max", "ultra"), model.reasoningLevels)
+            run("/model $id")
+            assertEquals(id, vm.state.value.pendingModel)
+            vm.confirmModelLevel("high")
+            await { it.provider?.model == id && it.pendingModel == null }
+            assertEquals("high", vm.state.value.provider?.reasoningEffort)
+            awaitStore { container.providerStore.load().first().model == id }
+        }
+    }
+
+    @Test
     fun `model with fuzzy name steps into level selection`() {
         run("/model gpt6 astra")
         assertEquals("gpt-6-astra", vm.state.value.pendingModel)
